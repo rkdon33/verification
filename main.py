@@ -1,5 +1,6 @@
 
 import os
+import asyncio
 import discord
 from discord import app_commands, Interaction, Embed, ButtonStyle
 from discord.ext import commands
@@ -26,9 +27,11 @@ SUBMISSION_CHANNEL_ID = 1404896507626520729
 MONGO_URI = "mongodb+srv://rkdon:R4JK4ND3L@rkdon.nmj3mpp.mongodb.net/?retryWrites=true&w=majority&appName=rkdon"
 mongo_enabled = False
 verify_setup = {}
+voice_channels_247 = {}
 mongo_client = None
 mongo_db = None
 mongo_coll = None
+voice_coll = None
 
 # Initialize MongoDB connection
 if MONGO_URI:
@@ -47,6 +50,7 @@ if MONGO_URI:
         )
         mongo_db = mongo_client["discord_bot"]
         mongo_coll = mongo_db["verify_setup"]
+        voice_coll = mongo_db["voice_channels_247"]
         mongo_enabled = True
         print("MongoDB connection configured")
     except ImportError:
@@ -111,6 +115,52 @@ async def set_verify_setup(guild_id, channel_id, role_id):
             "role_id": role_id
         }
 
+async def get_247_voice_channels():
+    """Get all 24/7 voice channels from storage"""
+    if mongo_enabled:
+        try:
+            cursor = voice_coll.find({})
+            channels = {}
+            async for doc in cursor:
+                channels[doc["guild_id"]] = doc["voice_channel_id"]
+            return channels
+        except Exception as e:
+            print(f"MongoDB read error for voice channels: {e}")
+            return voice_channels_247
+    else:
+        return voice_channels_247
+
+async def set_247_voice_channel(guild_id, voice_channel_id):
+    """Set 24/7 voice channel for a guild"""
+    global mongo_enabled
+    if mongo_enabled:
+        try:
+            await voice_coll.update_one(
+                {"guild_id": guild_id},
+                {"$set": {"voice_channel_id": voice_channel_id}},
+                upsert=True
+            )
+        except Exception as e:
+            print(f"MongoDB write error for voice channel: {e}. Falling back to in-memory storage.")
+            mongo_enabled = False
+            voice_channels_247[guild_id] = voice_channel_id
+    else:
+        voice_channels_247[guild_id] = voice_channel_id
+
+async def remove_247_voice_channel(guild_id):
+    """Remove 24/7 voice channel for a guild"""
+    global mongo_enabled
+    if mongo_enabled:
+        try:
+            await voice_coll.delete_one({"guild_id": guild_id})
+        except Exception as e:
+            print(f"MongoDB delete error for voice channel: {e}")
+            if guild_id in voice_channels_247:
+                del voice_channels_247[guild_id]
+    else:
+        if guild_id in voice_channels_247:
+            del voice_channels_247[guild_id]
+
 @tree.command(name="setverify", description="Setup the verification panel channel and role.")
 @app_commands.describe(
     channel="The channel where the verification panel will be sent",
@@ -154,6 +204,67 @@ async def sendverifypanel(interaction: Interaction):
         await interaction.response.send_message("I don't have permission to send messages in that channel!", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Failed to send panel: {str(e)}", ephemeral=True)
+
+@tree.command(name="join247", description="Make the bot join a voice channel 24/7.")
+@app_commands.describe(voice_channel="The voice channel the bot should join and stay in 24/7")
+async def join247(interaction: Interaction, voice_channel: discord.VoiceChannel):
+    """Join a voice channel 24/7 and save to database"""
+    # Check if user has permission to manage channels
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ You need 'Manage Channels' permission to use this command!", ephemeral=True)
+        return
+    
+    try:
+        # Check if bot is already connected to a voice channel in this guild
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.disconnect()
+        
+        # Connect to the voice channel
+        voice_client = await voice_channel.connect()
+        
+        # Save to database
+        await set_247_voice_channel(interaction.guild.id, voice_channel.id)
+        
+        embed = Embed(
+            title="🔊 24/7 Voice Connection",
+            description=f"<a:approved:1404893665884635268> **Successfully connected to {voice_channel.mention}!**\n\n**Features:**\n- Bot will stay connected 24/7\n- Auto-reconnect on restart\n- Auto-reconnect if disconnected",
+            color=0x00ff00
+        )
+        embed.set_footer(text=f"Connected to: {voice_channel.name}")
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don't have permission to join that voice channel!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to join voice channel: {str(e)}", ephemeral=True)
+
+@tree.command(name="leave247", description="Make the bot leave the 24/7 voice channel.")
+async def leave247(interaction: Interaction):
+    """Leave the 24/7 voice channel and remove from database"""
+    # Check if user has permission to manage channels
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ You need 'Manage Channels' permission to use this command!", ephemeral=True)
+        return
+    
+    try:
+        # Disconnect from voice if connected
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.disconnect()
+        
+        # Remove from database
+        await remove_247_voice_channel(interaction.guild.id)
+        
+        embed = Embed(
+            title="🔇 Left Voice Channel",
+            description="<a:approved:1404893665884635268> **Successfully left the voice channel and removed 24/7 configuration.**",
+            color=0xff9900
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to leave voice channel: {str(e)}", ephemeral=True)
 
 class PersistentVerifyView(View):
     """Persistent view for verification button that survives bot restarts"""
@@ -332,6 +443,9 @@ async def on_ready():
     bot.add_view(PersistentVerifyView())
     print("Added persistent verify view")
     
+    # Auto-join 24/7 voice channels
+    await auto_join_247_channels()
+    
     # Set bot status
     await bot.change_presence(activity=discord.Game(name="with gf (.) (.)"))
     
@@ -345,6 +459,40 @@ async def on_ready():
         print(f"Synced {len(synced_guild)} commands for guild {GUILD_ID}")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
+
+async def auto_join_247_channels():
+    """Auto-join all 24/7 voice channels on startup"""
+    try:
+        channels_247 = await get_247_voice_channels()
+        for guild_id, voice_channel_id in channels_247.items():
+            guild = bot.get_guild(guild_id)
+            if guild:
+                voice_channel = guild.get_channel(voice_channel_id)
+                if voice_channel and isinstance(voice_channel, discord.VoiceChannel):
+                    try:
+                        # Skip if already connected to this channel
+                        if guild.voice_client and guild.voice_client.channel.id == voice_channel_id:
+                            print(f"Already connected to {voice_channel.name} in {guild.name}")
+                            continue
+                        
+                        # Disconnect from any other channel first
+                        if guild.voice_client:
+                            await guild.voice_client.disconnect()
+                        
+                        # Connect to the 24/7 channel
+                        await voice_channel.connect()
+                        print(f"Auto-joined 24/7 voice channel: {voice_channel.name} in {guild.name}")
+                    except Exception as e:
+                        print(f"Failed to auto-join {voice_channel.name} in {guild.name}: {e}")
+                else:
+                    print(f"Voice channel {voice_channel_id} not found in guild {guild.name}")
+                    # Remove invalid channel from database
+                    await remove_247_voice_channel(guild_id)
+            else:
+                print(f"Guild {guild_id} not found, removing from 24/7 list")
+                await remove_247_voice_channel(guild_id)
+    except Exception as e:
+        print(f"Error in auto_join_247_channels: {e}")
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -363,6 +511,35 @@ async def on_app_command_error(interaction: discord.Interaction, error):
         print(f"App command error: {error}")
         if not interaction.response.is_done():
             await interaction.response.send_message("An error occurred while processing the command.", ephemeral=True)
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state updates for auto-reconnect"""
+    # Only care about the bot itself
+    if member != bot.user:
+        return
+    
+    # If bot was disconnected from a voice channel
+    if before.channel and not after.channel:
+        guild = before.channel.guild
+        channels_247 = await get_247_voice_channels()
+        
+        # Check if this guild has a 24/7 voice channel configured
+        if guild.id in channels_247:
+            voice_channel_id = channels_247[guild.id]
+            voice_channel = guild.get_channel(voice_channel_id)
+            
+            if voice_channel and isinstance(voice_channel, discord.VoiceChannel):
+                try:
+                    # Wait a bit before reconnecting to avoid spam
+                    await asyncio.sleep(5)
+                    
+                    # Only reconnect if not already connected
+                    if not guild.voice_client:
+                        await voice_channel.connect()
+                        print(f"Auto-reconnected to 24/7 voice channel: {voice_channel.name} in {guild.name}")
+                except Exception as e:
+                    print(f"Failed to auto-reconnect to {voice_channel.name}: {e}")
 
 if __name__ == "__main__":
     try:
